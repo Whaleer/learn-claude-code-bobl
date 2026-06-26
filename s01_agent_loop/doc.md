@@ -84,3 +84,61 @@ load_dotenv(override=True)
   -> 当前 Python 进程的环境变量
   -> os.getenv()
 ```
+
+
+# 5. 为什么调用模型后，还要把 `response.content` append 到 `messages`？
+
+相关代码：
+
+```python
+response = client.messages.create(
+    model=MODEL, system=SYSTEM, messages=messages,
+    tools=TOOLS, max_tokens=8000,
+)
+
+# Append assistant turn
+messages.append({"role": "assistant", "content": response.content})
+```
+
+这里的 `messages` 不是一次性请求参数，而是 agent loop 自己维护的完整对话历史。
+
+`client.messages.create(...)` 会把当前的 `messages` 发给模型，然后模型返回 `response`。这个 `response.content` 可能是普通文本，也可能是工具调用请求，比如模型想调用 `bash`。
+
+所以这句：
+
+```python
+messages.append({"role": "assistant", "content": response.content})
+```
+
+不是把同一段内容再次发送给模型，而是先把“assistant 这一轮说了什么 / 要调用什么工具”记录到本地历史里。
+
+它的意义在后面的工具调用里才体现出来：
+
+```python
+results.append({
+    "type": "tool_result",
+    "tool_use_id": block.id,
+    "content": output,
+})
+```
+
+`tool_result` 里的 `tool_use_id` 必须对应前面 assistant 消息里的 `tool_use` id。也就是说，下一轮模型需要看到完整链路：
+
+```text
+user: 帮我看一下当前目录
+assistant: 我要调用 bash，命令是 ls
+user: 这是 bash 的执行结果
+assistant: 根据结果继续回答或继续调用工具
+```
+
+如果不把 `response.content` append 进去，下一轮模型只看到工具结果，却看不到这个工具结果是回应哪一次工具调用的，对话历史就断了。
+
+所以这两步分别负责不同事情：
+
+```text
+append assistant response.content
+  -> 记录模型这一轮的输出，尤其是 tool_use 请求
+
+append user tool_result
+  -> 记录工具执行后的结果，让模型下一轮继续判断
+```
